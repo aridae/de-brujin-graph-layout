@@ -1,0 +1,126 @@
+"MERGE (g:Genome { id: $gId}) 
+MERGE (pref:KMer { value: $prefValue }) 
+MERGE (suff:KMer { value: $suffValue }) 
+MERGE (pref)-[rBP:Belongs]->(g) 
+MERGE (suff)-[rBS:Belongs]->(g) 
+MERGE (pref)-[r:Precedes]->(suff)",
+
+-- создать процедуру, которая генерирует мутирувнувшие кмеры 
+call apoc.custom.asProcedure(
+    "generateReplacementsMutations",
+    'WITH custom.replaceBases($n.value, $mutation_scheme) as mutatedValue
+    CALL apoc.merge.node(
+        ["KMer"],
+        {value: mutatedValue},
+        {mutated: 1},
+        {mutated: 1}
+    ) yield node 
+    CALL apoc.merge.relationship(
+        $n, "MutatedInto", {replacements:size($mutation_scheme)}, {},  node, {}
+    ) yield rel 
+    return node, rel;',
+    "write",
+    [["mutatedNode", "node"], ["mutationRel", "relationship"]],
+    [["n", "node"], ["mutation_scheme", "list of int"]]
+)
+
+-- сгенерировать все мутации замены основания для всех к-мер 
+-- и вывести их 
+MATCH (n:KMer)
+UNWIND apoc.coll.combinations([0,1,2], 1, 3) as mutation_scheme  
+CALL custom.generateReplacementsMutations(n, mutation_scheme) YIELD mutatedNode
+MATCH (m:KMer)
+return m;
+
+-- Для каждого мутировавшего кмера найти потенциальные связи в геноме 
+-- всм мутировавший кмер может вести в ту же ноду, что и исходный кмер, а может 
+-- вести в ноду, мутировавшую из исходного кмера 
+-- так, чтобы соблюдались отношения префикс-суффикс 
+
+-- Пусть кмер nInitial мутировал в nMutated
+-- nInitial ведет в какой-то кмер nNext (мб и нет)
+-- nNext ведет в какой-то кмер nNextMutated (мб и нет??)
+-- проверить на связь рефикс-суффикс ноды nMutated-nNext и nMutated-nNextMutated
+-- провести связи {potential: 1} если такая связь возможна
+MATCH (nInitial: KMer)-[m:MutatedInto]->(nMutated:KMer {mutated: 1})
+MATCH (nInitial)-[p:Precedes {real: 1}]->(nNext: KMer {real: 1})
+MATCH (nNext)-[nm:MutatedInto]->(nNextMutated: KMer {mutated: 1}) 
+CALL {
+    WITH nMutated, nNext
+    WITH nMutated, nNext
+    WHERE right(nMutated.value, 2) = left(nNext.value, 2)
+    CALL apoc.merge.relationship(
+        nMutated, 
+        "Precedes",
+        {},
+        {potential: 1},
+        nNext,
+        {potential: 1}
+    ) YIELD rel 
+    return rel as potentialNext
+}
+CALL {
+    WITH nMutated, nNextMutated
+    WITH nMutated, nNextMutated
+    WHERE right(nMutated.value, 2) = left(nNextMutated.value, 2)
+    CALL apoc.merge.relationship(
+        nMutated, 
+        "Precedes",
+        {},             -- а вот по этому условию мы фильтруем связи -- тк нам нужны все, ничего не фильтруем 
+        {potential: 1}, -- 1 вот это будет добавлено при создании связи 
+        nNextMutated,
+        {potential: 1} -- 2 вот это будет добавлено еслисвязь сущесвует (или наоборот 1<-->2, глянуть в доках) 
+    ) YIELD rel 
+    return rel as potentialNextMutated
+}
+RETURN nInitial, nNext, nMutated;
+
+
+ОБЪЯСНЕНИЕ ТОГО, ЧТО ПРОИСХОДИТ ТУТ: 
+
+MATCH (nInitial: KMer)-[m:MutatedInto]->(nMutated:KMer {mutated: 1}) -- берем все кмеры, которые во что-то мутировали 
+MATCH (nInitial)-[p:Precedes {real: 1}]->(nNext: KMer {real: 1})     -- и при этом куда-то ведут (в кмер некст) (зачем? нам только такие нужно соединять, если кмер последний, то и его мутация никуда не поведет)
+MATCH (nNext)-[nm:MutatedInto]->(nNextMutated: KMer {mutated: 1})    -- берем еще все мутации кмера некст 
+CALL {  -- магия: https://neo4j.com/developer/kb/conditional-cypher-execution/ 
+        -- просто WITH nMutated, nNext не заработает, а если два раза - то заработает (что??почему???)
+    WITH nMutated, nNext
+    WITH nMutated, nNext
+
+    -- из всех нодов nMutated, nNext для нашего nInitial берем только те, которые связаны как префикс-суффикс
+    -- тут 2 == k-1 (когда будет функция, сделаю параметром)
+    WHERE right(nMutated.value, 2) = left(nNext.value, 2)
+
+    -- и вот между этими найденными nMutated(префикс), nNext(суффикс) создаем потенциальную связь <<следует>>
+    CALL apoc.merge.relationship(
+        nMutated, 
+        "Precedes",
+        {},
+        {potential: 1},
+        nNext,
+        {potential: 1}
+    ) YIELD rel 
+    return rel as potentialNext
+}
+-- аналогично для нодов nMutated, nNextMutated
+CALL {
+    WITH nMutated, nNextMutated
+    WITH nMutated, nNextMutated
+    WHERE right(nMutated.value, 2) = left(nNextMutated.value, 2)
+    CALL apoc.merge.relationship(
+        nMutated, 
+        "Precedes",
+        {},
+        {potential: 1},
+        nNextMutated,
+        {potential: 1}
+    ) YIELD rel 
+    return rel as potentialNextMutated
+}
+-- AAA 
+RETURN nInitial, nNext, nMutated;
+
+
+
+НА ЭТОМ ЭТАПЕ У НАС ЕСТЬ ВСЕ МУТАЦИИ-ЗАМЕНЫ-ОСНОВАНИЙ-НА-КОМПЛЕМЕНТАРНЫЕ И ВСЕ ПОТЕНЦИАЛЬНЫЕ СВЯЗИ МЕЖДУ 
+ПОДСТРОКАМИ И МУТИРОВАВШИМИ ПОДСТРОКАМИ 
+ЧТО НУЖНО - ПОЛУЧИТЬ ПО ЗАПРОСУ ВСЕ ГОМОЛОГИЧНЫЕ ПОДСТРОКИ, ПОЛУЧЕННЫЕ МУТАЦИЕЙ-ЗАМЕНОЙ-ОСНОВАНИЯ 
