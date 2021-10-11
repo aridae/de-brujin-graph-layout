@@ -1,0 +1,13 @@
+>NC_030850.1 Theobroma cacao cultivar B97-61/B2 chromosome 1, Criollo_cocoa_genome_V2, whole genome shotgun sequence
+
+R 	A, G
+Y 	C, T
+K 	G, T
+M 	A, C
+S 	C, G
+W 	A, T
+B 	не A (то есть C, G, T)
+D 	не C (то есть A, G, T)
+H 	не G (A, C, T)
+V 	не T и не U (A, C или G)
+N   A, C, G, T

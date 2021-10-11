@@ -1,0 +1,41 @@
+
+\begin{table}[h!]
+	\caption{Однобуквенные коды нуклеотидов ДНК, определённые форматом FASTA.}
+	\label{tbl:table_codes}
+	\centering
+	\begin{tabular}{|c|c| }
+		\hline
+		Код & Значение  \\
+		\hline
+		A & Аденин \\
+		\hline
+		C & Цитозин \\
+		\hline
+		G & Гуанин \\
+		\hline
+		T & Тимин \\
+		\hline
+		R &	A, G \\
+		\hline
+		Y &	C, T \\
+		\hline
+		K &	G, T \\
+		\hline
+		M &	A, C \\
+		\hline
+		S &	C, G \\
+		\hline
+		W &	A, T \\
+		\hline
+		B &	C, G, T \\
+		\hline
+		D &	A, G, T \\
+		\hline
+		H &	A, C, T \\
+		\hline
+		V &	A, C, G \\
+		\hline
+		N &  A, C, G, T \\
+		\hline
+	\end{tabular}
+\end{table}

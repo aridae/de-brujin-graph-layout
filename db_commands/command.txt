@@ -1,0 +1,425 @@
+"MERGE (g:Genome { id: $gId}) 
+MERGE (pref:KMer { value: $prefValue }) 
+MERGE (suff:KMer { value: $suffValue }) 
+MERGE (pref)-[rBP:Belongs]->(g) 
+MERGE (suff)-[rBS:Belongs]->(g) 
+MERGE (pref)-[r:Precedes]->(suff)",
+
+-- заменить все основания из списка (индексов) на комплементарные 
+replaceBases: return reduce(new_value=$input, indx IN $mutation_scheme | custom.replaceBaseByIndex(new_value, indx))
+
+-- создать процедуру, которая генерирует мутирувнувшие кмеры 
+call apoc.custom.asProcedure(
+    "generateReplacementsMutations",
+    'WITH custom.replaceBases($n.value, $mutation_scheme) as mutatedValue
+    CALL apoc.merge.node(
+        ["KMer"],
+        {value: mutatedValue},
+        {mutated: 1},
+        {mutated: 1}
+    ) yield node 
+    CALL apoc.merge.relationship(
+        $n, "MutatedInto", {replacements:size($mutation_scheme)}, {},  node, {}
+    ) yield rel 
+    return node, rel;',
+    "write",
+    [["mutatedNode", "node"], ["mutationRel", "relationship"]],
+    [["n", "node"], ["mutation_scheme", "list of int"]]
+)
+
+-- сгенерировать все мутации замены основания для всех к-мер 
+-- и вывести их 
+MATCH (n:KMer)
+UNWIND apoc.coll.combinations([0,1,2], 0, 3) as mutation_scheme  
+CALL custom.generateReplacementsMutations(n, mutation_scheme) YIELD mutatedNode
+MATCH (m:KMer)
+return m;
+
+** ВАРИАНТ, ГДЕ ЕСТЬ МУТАЦИИ В СЕБЯ **
+MATCH (n:KMer)
+CALL apoc.merge.relationship(n, "MutatedInto", {replacements:0}, {},  n, {}) yield rel  
+UNWIND apoc.coll.combinations([0,1,2], 1, 3) as mutation_scheme  
+CALL custom.generateReplacementsMutations(n, mutation_scheme) YIELD mutatedNode
+MATCH (m:KMer)
+return m;
+
+-- Сгенерировать связи потенциального следования 
+-- (потенциального - то есть такой подстроки из 2х кмер нет, но она может быть получена мутациями)
+
+реальный кмер A потенциально следует в мутировавший кмер MB, если 
+* сущ кмер B такой что: A-Precedes->B && B-MutatedInto->MB
+* соблюдается связь суффикс(A)=префикс(MB)
+
+
+мутировавший кмер MA потенциально следует в реальный кмер B, если 
+* сущ кмер A такой что: А-MutatedInto->MA && A-Precedes->B
+* соблюдается связь суффикс(MA)=префикс(B)
+
+
+мутировавший кмер MA потенциально следует в мутировавший кмер MB, если 
+* сущ кмеры A и B такие что: А-MutatedInto->MA && B-MutatedInto->MB && A-Precedes->B
+* соблюдается связь суффикс(MA)=префикс(MB)
+
+*** СНАЧАЛА Я ПЫТАЛАСЬ ЭТО СДЕЛАТЬ ОДНИМ ЗАПРОСОМ КАК ТУТ https://neo4j.com/developer/kb/conditional-cypher-execution/ НО НЕ ВЫШЛО ***
+
+Поэтому вот три запроса в лоб: 
+******************************************************************************
+
+MATCH (nInitial: KMer {real: 1})
+OPTIONAL MATCH (nInitial)-[m:MutatedInto]->(nMutated:KMer {mutated: 1})
+OPTIONAL MATCH (nInitial)-[p:Precedes {real: 1}]->(nNext: KMer {real: 1})
+OPTIONAL MATCH (nNext)-[nm:MutatedInto]->(nNextMutated: KMer {mutated: 1}) 
+WITH nInitial as nI, nNextMutated as nNM
+WHERE right(nI.value, 2) = left(nNM.value, 2)
+CALL apoc.merge.relationship(
+    nI, 
+    "Precedes",
+    {},
+    {potential: 1},
+    nNM,
+    {potential: 1}
+) YIELD rel 
+return rel as potentialInitial;
+
+MATCH (nInitial: KMer {real: 1})
+OPTIONAL MATCH (nInitial)-[m:MutatedInto]->(nMutated:KMer {mutated: 1})
+OPTIONAL MATCH (nInitial)-[p:Precedes {real: 1}]->(nNext: KMer {real: 1})
+WITH nMutated as nM, nNext as nN
+WHERE right(nM.value, 2) = left(nN.value, 2)
+CALL apoc.merge.relationship(
+    nM, 
+    "Precedes",
+    {},
+    {potential: 1},
+    nN,
+    {potential: 1}
+) YIELD rel 
+return rel as potentialNext;
+
+MATCH (nInitial: KMer {real: 1})
+OPTIONAL MATCH (nInitial)-[m:MutatedInto]->(nMutated:KMer {mutated: 1})
+OPTIONAL MATCH (nInitial)-[p:Precedes {real: 1}]->(nNext: KMer {real: 1})
+OPTIONAL MATCH (nNext)-[nm:MutatedInto]->(nNextMutated: KMer {mutated: 1}) 
+WITH nMutated as nM, nNextMutated as nNM
+WHERE right(nM.value, 2) = left(nNM.value, 2)
+CALL apoc.merge.relationship(
+    nM, 
+    "Precedes",
+    {},            
+    {potential: 1}, 
+    nNM,
+    {potential: 1} 
+) YIELD rel 
+return rel as potentialNextMutated;
+
+******************************************************************************
+
+
+НА ЭТОМ ЭТАПЕ У НАС ЕСТЬ ВСЕ МУТАЦИИ-ЗАМЕНЫ-ОСНОВАНИЙ-НА-КОМПЛЕМЕНТАРНЫЕ И ВСЕ ПОТЕНЦИАЛЬНЫЕ СВЯЗИ МЕЖДУ 
+ПОДСТРОКАМИ И МУТИРОВАВШИМИ ПОДСТРОКАМИ 
+ЧТО НУЖНО - ПОЛУЧИТЬ ПО ЗАПРОСУ ВСЕ ГОМОЛОГИЧНЫЕ ПОДСТРОКИ, ПОЛУЧЕННЫЕ МУТАЦИЕЙ-ЗАМЕНОЙ-ОСНОВАНИЯ 
+
+-- можно сгенерировать кмеры из строки на стороне СУБД 
+-- т.е. на вход подается строка, мы режем ее на кмеры,
+-- и из этих кмер ищем путь, состоящий из исходных кмер или 
+-- мутирувнувших кмер 
+WITH 3 as k, "acgt" as input 
+UNWIND range(0, size(input) - k) AS X
+RETURN (left(right(input, size(input) - X), k));
+
+-- вот есть реальные кмеры - это существующий геном 
+-- есть мутировавшие кмеры - это мутировавшие подпоследовательности сущесвтующего генома
+
+-- найти к-меры бд или их мутировавшие вариации, которые входят в искомую строку 
+WITH 3 as k, "ACTGGA" as input 
+UNWIND range(0, size(input) - k) AS X
+WITH left(right(input, size(input) - X), k) AS tmpkmer
+MATCH (selectedNode:KMer {value:tmpkmer})
+WITH selectedNode
+OPTIONAL MATCH (selectedNode)-[:MutatedInto]->(mutatedNode:KMer)
+RETURN selectedNode, mutatedNode;
+
+-- найти путь, фиксированной длины, в который входят ноды ТОЛЬКО из:
+* искомых кмер (m)
+* их мутаций (m)
+    нужно ли брать ноды, в которые мутации ведут? нет, тк они не обязательно являются мутациями исходной строки 
+
+-- есть ли карантия соблюдения порядка? есть ли гарантия, что в пути будут все искомые кмеры(мутации), не будет пропусков?
+-- если нет циклов, все ок, НО ЦИКЛЫ ЕСТЬ и они нужны, потому что иначе как лохи 
+-- что с этим можно сделать - проверять, чтобы в пути участвовали все кмеры искомые к-меры или хотя бы по одной из 
+-- мутаций для каждой из исходных кмер
+
+WITH 3 as k, "ACTG" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+OPTIONAL MATCH (selectedNode)-[:MutatedInto]->(mutatedNode:KMer)
+WITH COLLECT(selectedNode)+COLLECT(mutatedNode) AS potentialNodes, kmerscnt
+CALL apoc.cypher.run("MATCH path=()-[:Precedes*"+(kmerscnt - 1)+"]->() WHERE ALL(n in nodes(path) WHERE n in potentialNs) RETURN path;", { potentialNs: potentialNodes }) YIELD value as paths
+return paths; 
+
+*** ТО ЖЕ САМОЕ, ТОЛЬКО ВОЗВРАТ В ВИДЕ СПИСКА ***
+
+WITH 3 as k, "ACTG" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+OPTIONAL MATCH (selectedNode)-[:MutatedInto]->(mutatedNode:KMer)
+WITH COLLECT(selectedNode)+COLLECT(mutatedNode) AS potentialNodes, kmerscnt
+CALL apoc.cypher.run("MATCH path=()-[:Precedes*"+(kmerscnt - 1)+"]->() WHERE ALL(n in nodes(path) WHERE n in potentialNs) RETURN path;", { potentialNs: potentialNodes }) YIELD value as paths
+WITH COLLECT(paths) as allPaths
+return allPaths;
+
+
+-- функция для читаемого вывода - путь преобразуем к строке 
+call apoc.custom.asFunction(
+    "pathToString",
+    "with nodes($path) as nodes return reduce(str=head(nodes).value, n in tail(nodes) | str+right(n.value, 1));",
+    "string",
+    [["path", "path"]]
+);
+
+WITH 3 as k, "ACCACC" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+OPTIONAL MATCH (selectedNode)-[:MutatedInto]->(mutatedNode:KMer)
+WITH COLLECT(selectedNode)+COLLECT(mutatedNode) AS potentialNodes, kmerscnt
+CALL apoc.cypher.run("MATCH path=()-[:Precedes*"+(kmerscnt - 1)+"]->() 
+WHERE ALL(n in nodes(path) WHERE n in potentialNs) RETURN path;", { potentialNs: potentialNodes }) YIELD value as pathMaps
+UNWIND pathMaps as pathMap
+RETURN custom.pathToString(pathMap.path);
+
+ВОТ собственно проблема циклов 
+на вход: CACCTG
+выход: 
+╒═══════════════════════════════════╕
+│"custom.pathToString(pathMap.path)"│
+╞═══════════════════════════════════╡
+│"ACCACC"                           │   вот тут - все кмеры найденного пути входят в множество искомых кмер и путь нужной длины, но он не может быть получен мутациями искомой строки
+├───────────────────────────────────┤
+│"CCACCT"                           │
+├───────────────────────────────────┤
+│"CCACCA"                           │   как и это
+├───────────────────────────────────┤
+│"CACCTT"                           │
+├───────────────────────────────────┤
+│"CACCTG"                           │
+├───────────────────────────────────┤
+│"CACCAC"                           │   и этот 
+├───────────────────────────────────┤
+│"CCCCAC"                           │   и этот - это все из-за одного цикла 
+├───────────────────────────────────┤
+│"CCCCTT"                           │
+├───────────────────────────────────┤
+│"CCCCTG"                           │
+├───────────────────────────────────┤
+│"CCCACC"                           │   и эти... это все тот же цикл шалит 
+├───────────────────────────────────┤   
+│"AACACC"                           │   
+├───────────────────────────────────┤
+│"AACCTT"                           │
+├───────────────────────────────────┤
+│"AACCTG"                           │
+├───────────────────────────────────┤
+│"AACCAC"                           │
+├───────────────────────────────────┤
+│"ACACCT"                           │
+├───────────────────────────────────┤
+│"ACACCA"                           │
+└───────────────────────────────────┘
+
+
+ЭТО ВСЕ КАКАЯ ТО ДИЧЬ ПОГОДИТЕ-КА 
+
+ТАК
+
+когда мы ищем все ноды, соответсвующие искомым кмерам в бд, в выборку могут попасть как реальные (принадлежащие реальному геному)
+кмеры, так и их мутировавшие вариации (нереальные) - мы можем найти, существует ли путь между найденными кмерами 
+(вперемешку сущесвующими и мутировавшими) - то есть чисто в теории в бд есть родственники или такую подстроку даже мутациями не получить? 
+
+вот мы нашли этот путь, который соержит исходную строку, 
+1 - либо сущсвтует в бд как реальная подстрока генома, тогда 100% совпадаение, все топ 
+2 - либо сущсвует как мутировавшая вариация реальной подстроки генома 
+Можно ли по этому полученному пути (списку кмеров) получить теперь мутациями КАКОЙ строки была получена найденная 
+это будут не ВСЕ ТЕОРЕТИЧЕСКИ ВОЗМОЖНЫЕ МУТАЦИИ ИСКОМОЙ СТРОКИ (как в прошлом запросе), 
+а только (!!!)те мутации исходной строки, которые являются подстроками реальных геномов в бд(!!!)
+
+ЗАДАЧА 1 - получить все ноды бд, которые содержат искомые к-меры (это могут быть реальные или мутировавшие ноды)
+*****************************************************************************************************************
+WITH 3 as k, "ACCACC" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+RETURN selectedNode;
+*****************************************************************************************************************
+
+ЗАДАЧА 2 - вариант решения 1 - проверить, сущесвует ли путь, который содержит все ноды в списке (все запрашиваемые ноды) - ну и вернуть этот путь 
+*****************************************************************************************************************
+WITH collect(n) as nodes -- берем список нодов 
+WITH nodes, nodes[0] as start, tail(nodes) as tail, size(nodes)-1 as depth -- берем его голову, хвост, размер хвоста 
+CALL apoc.path.expandConfig( -- найти путь 
+    start, -- начиная с этого нода 
+    {
+        whitelistNodes:nodes, 
+        minLevel:depth, -- размер пути (мин и макс совпадают)
+        maxLevel:depth, 
+        relationshipFilter:'NEXT>'-- путь должен содержать только ноды этого типа, направление задано 
+        -- но нет гарантии, что путь содержит все ноды из списка, только гарантия того, что в пути не будет лишних 
+        -- тут проблема с циклами опять - без них ограничение на длину и направление все фиксит, а с ними - нет 
+    }
+) YIELD path -- вернули найденный путь 
+// WHERE all(index in range(0, size(selectedNodes)-1) WHERE selectedNodes[index] = nodes(path)[index])
+// вот так можно отфильтровать путь но это будет долго, тк проход по всем нодам в пути - линейное время, 
+// но это лучше чем конкатенировать строку-запрос 
+RETURN path; 
+*****************************************************************************************************************
+
+-----------------------------------------------------------------------------------------------------------------------
+-- как проверять, чтобы в пути участвовали искомые к-меры 
+-- можно построить путь
+(к-мера-1-или-ее-мутации)-[:Precedes]->(к-мера-2-или-ее-мутации)-[:Precedes]->(...)-[:Precedes]->(к-мера-n-или-ее-мутации)
+
+То есть форма запроса зависит от входной таблицы кмера-мутации - он динамический, нео4ж в принципе так не может, но можно 
+это обойти с apoc.cypher.run - то есть сначала сконкатенировать строку запроса в цикле, а потом запустить полученный запрос 
+так можно гарантировать, что мутации будут явно подобраны для каждого из исхомых кмер(!!!) 
+
+но конкатенировать строку запроса для большого числа кмер (порядка миллиардов) будет прям очень плохо, очень 
+можно ли по-другому гарантировать, что мутации будут найдены для каждого из исходных к-мер и все исходные кмеры(или их мутации) поучаствуютв пути
+
+-- можно после поиска путей ввести доп фильтр - вернуть из найденных только те пути, которые содержат в точности все 
+-- искомые ноды  
+
+-- можно найти наоборот - кратчайший путь, который содержит все искомые ноды, но это не будет гарантировать, что в этом пути
+-- не будет лишних нод и нет возможности указать длину пути 
+-- допутим мы нашли кратчайший путь, котоый содержит все искомые ноды (и возможно лишние) 
+-- если он кратчайший, значит в случае существования подстроки лишних нод быть вообще не должно 
+-- поэтому достаточно проверить, что лишних нод нет?? а можно это как-то математически доказать, пожалуйста...
+-----------------------------------------------------------------------------------------------------------------------
+
+ЗАДАЧА 2 - вариант решения 2 - найти кратчайший путь, который содержит все искомые ноды и возможно лишние - ага как...
+-- проверить, есть ли там лишние -- если есть, то не сущесвтует такой подстроки даже с учетом мутаций замены оснований  
+*****************************************************************************************************************
+WITH 3 as k, "ACCACT" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+WITH collect(selectedNode) as selectedNodes, kmerscnt
+CALL apoc.cypher.run("
+    UNWIND selectedNs as n
+    UNWIND selectedNs as m 
+    MATCH path = allShortestPaths((n)-[:Precedes*0.."+ kmerscnt +"]->(m)) 
+    WHERE size(nodes(path)) = "+ kmerscnt +"
+    AND ALL (np in nodes(path) WHERE np in selectedNs) 
+    RETURN path;", 
+    { selectedNs: selectedNodes }) 
+    YIELD value as pathMaps 
+RETURN pathMaps;
+ЭТО НЕ РАБОТАЕТ КАК НАДО, ОН НЕ СОДЕРЖИТ ВСЕ ИСКОМЫЕ НОДЫ :_((
+*****************************************************************************************************************
+
+
+ВСЕ ЦЕЛИКОМ:
+*****************************************************************************************************************
+WITH 3 as k, "ACATG" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+WITH collect(selectedNode) as selectedNodes, kmerscnt
+WITH selectedNodes, selectedNodes[0] as start, tail(selectedNodes) as tail, kmerscnt-1 as depth
+CALL apoc.path.expandConfig( 
+    start, 
+    {
+        whitelistNodes:selectedNodes, 
+        minLevel:depth, 
+        maxLevel:depth, 
+        relationshipFilter:'Precedes>'
+    }
+) YIELD path 
+WHERE all(index in range(0, size(selectedNodes)-1) WHERE selectedNodes[index] = nodes(path)[index])
+RETURN path;
+*****************************************************************************************************************
+
+ИСПРАВЛЕНО
+ага нашла ошибку в генерации связей между мутировавшими кмерами 
+в бд есть подстрока ACCTG
+ищу строку ACATG - должна найтись, тк может быть получена мутациями 
+1 - для строки ACATG сгенерирвоались кмеры ACA CAT ATG, 
+2 - для них были найедны ноды в бд - что логично,так как ноды могут быть получены мутациями исходных нод (ACC, CCT, CTG)
+    но отношений следования для найденных нод не сущесвтует - а так быть не должно где-то ошибка что делать где ошибка 
+ИСПРАВЛЕНО 
+
+
+ЭТО НА НОВЫЙ ГОД - мб можно как-то использовать: 
+https://stackoverflow.com/questions/58360404/neo4j-how-can-i-find-if-a-path-traversing-multiple-nodes-given-in-a-list-exist
+WHERE all(index in range(0, size(nodes)-1) WHERE nodes[index] = nodes(path)[index])
+// we now have only paths with the given nodes in order
+WITH path, relationships(path)[0].s as sequence
+WHERE all(rel in tail(relationships(path)) WHERE rel.s = sequence)
+// now each path only has relationships of common sequence
+WITH path, apoc.coll.pairsMin([rel in relationships(path) | rel.p]) as pairs
+WHERE all(pair in pairs WHERE pair[0] + 1 = pair[1])
+RETURN path
+**********************************************************************************
+
+
+НА ЭТОМ ЭТАПЕ Я МОГУ ПОЛУЧИТЬ НАЛИЧИЕ ИЛИ ОТСУТСТВИЕ ИСКОМОЙ СТРОКИ В БД - КАК РЕАЛЬНОЙ ИЛИ МУТИРОВАВШЕЙ ПОДПОСЛЕДОВАТЕЛЬНОСТИ 
+В теории из этой строки можно получить: 
+Задача 1 - из чего (из какой реальной подстроки) она мутировала и сколько мутаций 
+Задача 2 - во что она может мутировать и сколько мутаций для каждого варианта (можно ли использовать кусок прошлого решения?)
+
+************************************************************************
+Задача 1 - из чего она могла мутировать в бд (из каких реальных(!) геномов)
+найти все пути, такие что мутации нодов пути переводят их в искомый путь 
+грубо говоря нужно найти проекцию найденного пути на реальные к-меры 
+
+найти путь состоящий из реальных(!!) кмер, которые могут мутировать в найденные кмеры 
+****************************************************************************************
+WITH 3 as k, "ACATT" as input
+WITH  size(input) - k + 1 as kmerscnt, k, input 
+UNWIND range(0, kmerscnt - 1) AS X
+WITH left(right(input, kmerscnt + k - 1 - X), k) AS tmpkmer, kmerscnt
+MATCH (selectedNode:KMer {value:tmpkmer})
+WITH collect(selectedNode) as selectedNodes, kmerscnt
+WITH selectedNodes, selectedNodes[0] as start, tail(selectedNodes) as tail, kmerscnt-1 as depth
+CALL apoc.path.expandConfig( 
+    start, 
+    {
+        whitelistNodes:selectedNodes, 
+        minLevel:depth, 
+        maxLevel:depth, 
+        relationshipFilter:'Precedes>'
+    }
+) YIELD path 
+WHERE all(index in range(0, size(selectedNodes)-1) WHERE selectedNodes[index] = nodes(path)[index])
+WITH path, size(nodes(path))-1 as pathlen
+CALL apoc.cypher.run(
+    "MATCH projectedPath=()-[:Precedes*"+ pathlen +"]->() 
+    WHERE all(i in range(0, "+ pathlen +") 
+        WHERE nodes(projectedPath)[i] in custom.getListedSourcesOfMutation(nodes(actualPath)[i]))
+    RETURN projectedPath;", 
+    { actualPath: path }) 
+YIELD value as pathMaps
+return custom.pathToString(pathMaps.projectedPath);
+
+****************************************************************************************
+
+Входная последовательность (ее нет в исходном геноме)
+Выходные последовательности (те последовательности, 
+    из которых входная могла получиться мутацией замены-основания)
+ACATG: ACCTG
+ACCTG: ACCTG 
+CAAAA: 
+    "ACCAC"
+    "CCACC"
+    "CACCA"
+
+Как получить количество мутаций для каждого пути 
+
+
